@@ -522,7 +522,7 @@ bool intel_driver::MmFreeIndependentPages(HANDLE device_handle, uint64_t address
 			Log(L"[!] Failed to find MmFreeIndependentPages" << std::endl);
 			return false;
 		}
-		kernel_MmFreeIndependentPages += intel_driver::ntoskrnlAddr;
+		//kernel_MmFreeIndependentPages += intel_driver::ntoskrnlAddr;
 	}
 
 	uint64_t result{};
