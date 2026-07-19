@@ -161,7 +161,8 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		if (!FixSecurityCookie(local_image_base, kernel_image_base ))
 		{
 			kdmLog(L"[-] Failed to fix cookie" << std::endl);
-			return 0;
+			kernel_image_base = realBase;
+			break;
 		}
 
 		if (!ResolveImports(portable_executable::GetImports(local_image_base))) {
@@ -193,6 +194,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 				}
 				};
 
+			bool section_protection_failed = false;
 			for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++) {
 				auto sec = &IMAGE_FIRST_SECTION(nt_headers)[i];
 				uintptr_t secAddr = kernel_image_base + sec->VirtualAddress;
@@ -225,7 +227,14 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 				if (!intel_driver::MmSetPageProtection(secAddr, secSize, prot)) {
 					kdmLog(L"[-] Failed to set protection for section: " << (char*)sec->Name << std::endl);
+					section_protection_failed = true;
+					break;
 				}
+			}
+
+			if (section_protection_failed) {
+				kernel_image_base = realBase;
+				break;
 			}
 		}
 
@@ -305,6 +314,19 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	}
 
 	return 0;
+}
+
+ULONG64 kdmapper::MapDriver(HANDLE device_handle, BYTE* data, ULONG64 param1,
+	ULONG64 param2, bool free, bool destroyHeader, AllocationMode mode,
+	bool PassAllocationAddressAsFirstParam, mapCallback callback,
+	NTSTATUS* exitCode) {
+	if (!intel_driver::IsActiveHandle(device_handle)) {
+		kdmLog(L"[-] Invalid or stale mapper device handle" << std::endl);
+		return 0;
+	}
+
+	return MapDriver(data, param1, param2, free, destroyHeader, mode,
+		PassAllocationAddressAsFirstParam, callback, exitCode);
 }
 
 

@@ -10,6 +10,9 @@
 namespace intel_driver
 {
 	constexpr ULONG32 ioctl1 = 0x80862007;
+	inline constexpr char upstream_revision[] =
+		"280f65733d6469cfdae9dff76f24793d90f1f672";
+	inline constexpr char nebula_integration_revision[] = "2026-07-19.1";
 	extern HANDLE hDevice;
 	extern ULONG64 ntoskrnlAddr;
 
@@ -33,6 +36,40 @@ namespace intel_driver
 	NTSTATUS Load();
 	NTSTATUS Unload();
 
+	// Compatibility entry point for embedders that still keep the mapper
+	// device handle in their own operation context.  Upstream now owns the
+	// handle globally, so callers should use this instead of interpreting an
+	// NTSTATUS as a HANDLE.
+	inline HANDLE LoadDevice(NTSTATUS* load_status = nullptr) {
+		auto status = Load();
+		if (NT_SUCCESS(status) &&
+			(!hDevice || hDevice == INVALID_HANDLE_VALUE)) {
+			Unload();
+			status = STATUS_INVALID_HANDLE;
+		}
+		if (load_status)
+			*load_status = status;
+		return NT_SUCCESS(status) ? hDevice : INVALID_HANDLE_VALUE;
+	}
+
+	inline bool IsActiveHandle(HANDLE device_handle) {
+		return device_handle && device_handle != INVALID_HANDLE_VALUE &&
+			device_handle == hDevice;
+	}
+
+	inline bool Unload(HANDLE device_handle, NTSTATUS* unload_status) {
+		auto status = STATUS_INVALID_HANDLE;
+		if (IsActiveHandle(device_handle))
+			status = Unload();
+		if (unload_status)
+			*unload_status = status;
+		return NT_SUCCESS(status);
+	}
+
+	inline bool Unload(HANDLE device_handle) {
+		return Unload(device_handle, nullptr);
+	}
+
 	bool MemCopy(uint64_t destination, uint64_t source, uint64_t size);
 	bool SetMemory(uint64_t address, uint32_t value, uint64_t size);
 	bool GetPhysicalAddress(uint64_t address, uint64_t* out_physical_address);
@@ -53,6 +90,50 @@ namespace intel_driver
 	bool ClearMmUnloadedDrivers();
 	std::wstring GetDriverNameW();
 	std::wstring GetDriverPath();
+
+	// Legacy-handle adapters keep existing library consumers source-compatible
+	// with the upstream global-device API while rejecting stale handles.
+	inline bool ReadMemory(HANDLE device_handle, uint64_t address, void* buffer,
+		uint64_t size) {
+		return IsActiveHandle(device_handle) && ReadMemory(address, buffer, size);
+	}
+
+	inline bool WriteMemory(HANDLE device_handle, uint64_t address, void* buffer,
+		uint64_t size) {
+		return IsActiveHandle(device_handle) && WriteMemory(address, buffer, size);
+	}
+
+	inline uint64_t MmAllocateIndependentPagesEx(HANDLE device_handle,
+		uint32_t size) {
+		return IsActiveHandle(device_handle) ? MmAllocateIndependentPagesEx(size) : 0;
+	}
+
+	inline bool MmFreeIndependentPages(HANDLE device_handle, uint64_t address,
+		uint32_t size) {
+		return IsActiveHandle(device_handle) &&
+			MmFreeIndependentPages(address, size);
+	}
+
+	inline BOOLEAN MmSetPageProtection(HANDLE device_handle, uint64_t address,
+		uint32_t size, ULONG new_protect) {
+		return IsActiveHandle(device_handle) ?
+			MmSetPageProtection(address, size, new_protect) : FALSE;
+	}
+
+	inline uint64_t AllocatePool(HANDLE device_handle, nt::POOL_TYPE pool_type,
+		uint64_t size) {
+		return IsActiveHandle(device_handle) ? AllocatePool(pool_type, size) : 0;
+	}
+
+	inline bool FreePool(HANDLE device_handle, uint64_t address) {
+		return IsActiveHandle(device_handle) && FreePool(address);
+	}
+
+	inline uint64_t GetKernelModuleExport(HANDLE device_handle,
+		uint64_t kernel_module_base, const std::string& function_name) {
+		return IsActiveHandle(device_handle) ?
+			GetKernelModuleExport(kernel_module_base, function_name) : 0;
+	}
 
 	template<typename T, typename ...A>
 	bool CallKernelFunction(T* out_result, uint64_t kernel_function_address, const A ...arguments) {
@@ -127,5 +208,12 @@ namespace intel_driver
 
 		// Restore the pointer/jmp
 		return WriteToReadOnlyMemory(kernel_NtAddAtom, original_kernel_function, sizeof(kernel_injected_jmp));
+	}
+
+	template<typename T, typename ...A>
+	bool CallKernelFunction(HANDLE device_handle, T* out_result,
+		uint64_t kernel_function_address, const A ...arguments) {
+		return IsActiveHandle(device_handle) &&
+			CallKernelFunction(out_result, kernel_function_address, arguments...);
 	}
 }

