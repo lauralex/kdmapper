@@ -13,22 +13,27 @@ Tested from **Windows 10 1607** to **Windows 11 25H2 26200.8875** :heavy_check_m
 
 	--copy-header to enable the copy driver header option by commandline
 	--free to automatically unmap the allocated memory
-	--indPages to map in allocated independent pages
+	--indPages to map in allocated independent pages (uses private kernel routines; availability varies by kernel image)
 	--PassAllocationPtr to pass allocation ptr as first param
 	[PDB offset based build only]:
 	--offsetsPath "FilePath" to include your own offsets file path (by default .\offsets.ini)(if FilePath contains spaces, it must be enclosed in quotation marks)
 	--dontUpdateOffsets to execute without updating the offsets file (warning: you have to be sure that the offsets are not outdated to your current windows build, or you risk a potential BSOD)
 	
 
+When used by hv-nebula, the helper load callback must supply the three
+independent-page routine RVAs from the PDB verified against the loaded kernel.
+If any symbol is missing or points outside executable ntoskrnl code, helper
+startup fails before mapping or stopping the hypervisor. Standalone kdmapper
+without a callback retains its guarded signature lookup for --indPages.
+Signature lookup is version-dependent and is not proof of symbol identity.
+
+
 ## Features:
 	
 	Works with /GS- compiled drivers
 	Hooks NtAddAtom which exists everywhere and is rarely called
-	Clears MmUnloadedDrivers
-	Clears PiDDBCacheTable
-	Clears g_KernelHashBucketList
-	Clears Wdfilter RuntimeDriverList RuntimeDriverCount and RuntimeDriverArry
-	Use NtLoadDriver and NtUnloadDriver for less traces
+	Leaves Windows driver-load records intact; helper load and unload do not depend on private cache or list cleanup
+	Uses NtLoadDriver and NtUnloadDriver for helper lifecycle
 	Prevent load if \Device\Nal exists (Prevents BSOD)
 	Header section skipped while copying driver to kernel
 	Added the possibility to modify params before call driver entry

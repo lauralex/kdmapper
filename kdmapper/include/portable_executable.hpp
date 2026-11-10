@@ -2,16 +2,10 @@
 #include <Windows.h>
 #include <vector>
 #include <string>
+#include <cstddef>
 
 namespace portable_executable
 {
-	struct RelocInfo
-	{
-		ULONG64 address;
-		USHORT* item;
-		ULONG32 count;
-	};
-
 	struct ImportFunctionInfo
 	{
 		std::string name;
@@ -25,10 +19,15 @@ namespace portable_executable
 	};
 
 	using vec_sections = std::vector<IMAGE_SECTION_HEADER>;
-	using vec_relocs = std::vector<RelocInfo>;
+	// Each target is an immutable, bounds-checked RVA. The relocation table in
+	// the local image may itself be changed by an earlier relocation write.
+	using vec_relocs = std::vector<ULONG32>;
 	using vec_imports = std::vector<ImportInfo>;
 
-	PIMAGE_NT_HEADERS64 GetNtHeaders(void* image_base);
-	vec_relocs GetRelocs(void* image_base);
-	vec_imports GetImports(void* image_base);
+	PIMAGE_NT_HEADERS64 GetNtHeaders(const void* image_base, size_t image_size);
+	bool ValidateFileImage(const BYTE* data, size_t data_size, PIMAGE_NT_HEADERS64* headers);
+	bool ValidateLoadConfig(const void* image_base, size_t image_size);
+	bool GetRelocs(void* image_base, size_t image_size, vec_relocs* relocs);
+	bool ApplyRelocations(void* image_base, size_t image_size, const vec_relocs& relocs, ULONG64 delta);
+	bool GetImports(void* image_base, size_t image_size, vec_imports* imports);
 }

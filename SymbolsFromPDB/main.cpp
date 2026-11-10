@@ -21,27 +21,14 @@ std::wstring GetCurrentAppFolder() {
 int main()
 {
 	std::vector<std::wstring> targetBinaries = {
-		L"C:\\Windows\\System32\\ntoskrnl.exe",
-		L"C:\\Windows\\System32\\ci.dll"
+		L"C:\\Windows\\System32\\ntoskrnl.exe"
 	};
 
 	std::vector<SymNeeded> symbolsToRetrieve{
 		{ L"ntoskrnl.exe", L"MmAllocateIndependentPagesEx" },
 		{ L"ntoskrnl.exe", L"MmFreeIndependentPages" },
-		{ L"ntoskrnl.exe", L"PiDDBLock" },
-		{ L"ntoskrnl.exe", L"PiDDBCacheTable" },
 		{ L"ntoskrnl.exe", L"MmSetPageProtection" },
-		{ L"ci.dll", L"g_KernelHashBucketList" },
-		{ L"ci.dll", L"g_HashCacheLock" },
 	};
-
-	std::wstring WdFltrPath = L"C:\\Windows\\System32\\drivers\\wd\\WdFilter.sys";
-	if (std::filesystem::exists(WdFltrPath))
-	{
-		targetBinaries.push_back(WdFltrPath);
-		symbolsToRetrieve.push_back({ L"WdFilter.sys", L"MpBmDocOpenRules" });
-		symbolsToRetrieve.push_back({ L"WdFilter.sys", L"MpFreeDriverInfoEx" });
-	}
 
 	SimplestSymbolHandler handler(GetCurrentAppFolder() + L"\\Symbols");
 

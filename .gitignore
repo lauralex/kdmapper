@@ -4,4 +4,6 @@ kdmapper/kdmapper.vcxproj.user
 x64
 HelloWorld/.vs
 Intermediate
+/build/
+kdmapper/build/
 SymbolsFromPDB/offsets.ini

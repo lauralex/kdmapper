@@ -14,7 +14,8 @@
 namespace kdmUtils
 {
 	std::wstring GetFullTempPath();
-	bool ReadFileToMemory(const std::wstring& file_path, std::vector<BYTE>* out_buffer);
+	bool ReadFileToMemory(const std::wstring& file_path, std::vector<BYTE>* out_buffer,
+		size_t max_bytes = static_cast<size_t>(-1));
 	bool CreateFileFromMemory(const std::wstring& desired_file_path, const char* address, size_t size);
 	uint64_t GetKernelModuleAddress(const std::string& module_name);
 	BOOLEAN bDataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask);

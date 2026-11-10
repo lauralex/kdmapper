@@ -10,6 +10,7 @@
 #include "kdmapper.hpp"
 #include "utils.hpp"
 #include "intel_driver.hpp"
+#include "portable_executable.hpp"
 
 #ifdef PDB_OFFSETS
 #include "KDSymbolsHandler.h"
@@ -23,7 +24,7 @@ LONG WINAPI SimplestCrashHandler(EXCEPTION_POINTERS* ExceptionInfo)
 		kdmLog(L"[!!] Crash" << std::endl);
 
 	if (intel_driver::hDevice)
-		intel_driver::Unload();
+		kdmLog(L"[!!] Helper state is unknown after the crash; leaving it available for inspection" << std::endl);
 
 	return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -146,6 +147,10 @@ int wmain(const int argc, wchar_t** argv) {
 	}
 
 	if (FilePathParamIdx > 0) {
+		if (FilePathParamIdx + 1 >= argc) {
+			help();
+			return -1;
+		}
 		offsetFilePath = argv[FilePathParamIdx + 1];
 		kdmLog("[+] Setting Offsets File Path To: " << offsetFilePath << std::endl);
 	}
@@ -173,22 +178,28 @@ int wmain(const int argc, wchar_t** argv) {
 	}
 
 #ifdef PDB_OFFSETS
-	if (!KDSymbolsHandler::GetInstance()->ReloadFile(offsetFilePath, UpdateOffset ? kdmUtils::GetCurrentAppFolder() + L"\\" + SYM_FROM_PDB_EXE : L"")) {
+	if (indPagesMode && !KDSymbolsHandler::GetInstance()->ReloadFile(offsetFilePath, UpdateOffset ? kdmUtils::GetCurrentAppFolder() + L"\\" + SYM_FROM_PDB_EXE : L"")) {
 		kdmLog(L"[-] Error: Failed To Get Symbols Info." << std::endl);
 		PauseIfParentIsExplorer();
 		return -1;
 	}
 #endif
 
-	if (!NT_SUCCESS(intel_driver::Load())) {
+	std::vector<uint8_t> raw_image;
+	if (!kdmUtils::ReadFileToMemory(driver_path, &raw_image)) {
+		kdmLog(L"[-] Failed to read image to memory" << std::endl);
 		PauseIfParentIsExplorer();
 		return -1;
 	}
-
-	std::vector<uint8_t> raw_image = { 0 };
-	if (!kdmUtils::ReadFileToMemory(driver_path, &raw_image)) {
-		kdmLog(L"[-] Failed to read image to memory" << std::endl);
-		intel_driver::Unload();
+	PIMAGE_NT_HEADERS64 image_headers = nullptr;
+	if (!portable_executable::ValidateFileImage(raw_image.data(), raw_image.size(), &image_headers)) {
+		kdmLog(L"[-] Invalid or truncated driver image" << std::endl);
+		PauseIfParentIsExplorer();
+		return -1;
+	}
+	NTSTATUS const helper_status = intel_driver::Load();
+	if (!NT_SUCCESS(helper_status)) {
+		kdmLog(L"[-] Helper load failed with NTSTATUS 0x" << std::hex << helper_status << std::dec << std::endl);
 		PauseIfParentIsExplorer();
 		return -1;
 	}
@@ -200,17 +211,38 @@ int wmain(const int argc, wchar_t** argv) {
 	}
 
 	NTSTATUS exitCode = 0;
-	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, callbackExample, &exitCode)) {
+	kdmapper::map_result map_outcome{};
+	if (!kdmapper::MapDriver(raw_image.data(), raw_image.size(), 0, 0, free, !copyHeader, mode, passAllocationPtr, callbackExample, &exitCode, &map_outcome)) {
 		kdmLog(L"[-] Failed to map " << driver_path << std::endl);
-		intel_driver::Unload();
+		if (map_outcome.image_retained || !map_outcome.trampoline_intact) {
+			kdmLog(L"[!] Retaining helper and possible kernel image at 0x" << std::hex << map_outcome.image_base << std::dec << std::endl);
+			kdmLog(L"[!] Kernel call trampoline intact: " << map_outcome.trampoline_intact << std::endl);
+		}
+		else if (!NT_SUCCESS(intel_driver::Unload())) {
+			kdmLog(L"[-] Failed to unload helper after mapping failure" << std::endl);
+		}
 		PauseIfParentIsExplorer();
 		return -1;
+	}
+
+	if (!NT_SUCCESS(exitCode)) {
+		kdmLog(L"[-] DriverEntry returned failure status 0x" << std::hex << exitCode << std::dec << std::endl);
+		if (map_outcome.image_retained) {
+			kdmLog(L"[!] Retaining helper and mapped image at 0x" << std::hex << map_outcome.image_base << std::dec << std::endl);
+			PauseIfParentIsExplorer();
+			return -1;
+		}
 	}
 
 	if (!NT_SUCCESS(intel_driver::Unload())) {
 		kdmLog(L"[-] Warning failed to fully unload vulnerable driver " << std::endl);
 		PauseIfParentIsExplorer();
+		return -1;
 	}
+	if (!NT_SUCCESS(exitCode))
+		return -1;
+	if (free && map_outcome.image_release_call_completed)
+		kdmLog(L"[+] Kernel image release call completed; deallocation was not independently verified" << std::endl);
 	kdmLog(L"[+] success" << std::endl);
 
 }

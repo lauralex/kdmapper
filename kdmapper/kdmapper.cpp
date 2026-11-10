@@ -7,33 +7,25 @@
 #include "nt.hpp"
 #include "portable_executable.hpp"
 
-void RelocateImageByDelta(portable_executable::vec_relocs relocs, const ULONG64 delta) {
-	for (const auto& current_reloc : relocs) {
-		for (auto i = 0u; i < current_reloc.count; ++i) {
-			const uint16_t type = current_reloc.item[i] >> 12;
-			const uint16_t offset = current_reloc.item[i] & 0xFFF;
-
-			if (type == IMAGE_REL_BASED_DIR64)
-				*reinterpret_cast<ULONG64*>(current_reloc.address + offset) += delta;
-		}
-	}
-}
-
 // Fix cookie by @Jerem584
-bool FixSecurityCookie(void* local_image, ULONG64 kernel_image_base)
+bool FixSecurityCookie(void* local_image, size_t image_size, ULONG64 kernel_image_base)
 {
-	auto headers = portable_executable::GetNtHeaders(local_image);
+	auto headers = portable_executable::GetNtHeaders(local_image, image_size);
 	if (!headers)
 		return false;
 
-	auto load_config_directory = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+	const auto& directory = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+	auto load_config_directory = directory.VirtualAddress;
 	if (!load_config_directory)
 	{
 		kdmLog(L"[+] Load config directory wasn't found, probably StackCookie not defined, fix cookie skipped" << std::endl);
 		return true;
 	}
 
-	auto load_config_struct = (PIMAGE_LOAD_CONFIG_DIRECTORY)((uintptr_t)local_image + load_config_directory);
+	if (directory.Size < offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) + sizeof(ULONGLONG) ||
+		load_config_directory > image_size || directory.Size > image_size - load_config_directory)
+		return false;
+	auto load_config_struct = (PIMAGE_LOAD_CONFIG_DIRECTORY64)((uintptr_t)local_image + load_config_directory);
 	auto stack_cookie = load_config_struct->SecurityCookie;
 	if (!stack_cookie)
 	{
@@ -41,7 +33,10 @@ bool FixSecurityCookie(void* local_image, ULONG64 kernel_image_base)
 		return true; // as I said, it is not an error and we should allow that behavior
 	}
 
-	stack_cookie = stack_cookie - (uintptr_t)kernel_image_base + (uintptr_t)local_image; //since our local image is already relocated the base returned will be kernel address
+	if (stack_cookie < kernel_image_base || stack_cookie - kernel_image_base > image_size ||
+		sizeof(uintptr_t) > image_size - (stack_cookie - kernel_image_base))
+		return false;
+	stack_cookie = stack_cookie - (uintptr_t)kernel_image_base + (uintptr_t)local_image;
 
 	if (*(uintptr_t*)(stack_cookie) != 0x2B992DDFA232) {
 		kdmLog(L"[-] StackCookie already fixed!? this probably wrong" << std::endl);
@@ -75,12 +70,12 @@ bool ResolveImports(portable_executable::vec_imports imports) {
 				//Lets try with ntoskrnl
 				if (Module != intel_driver::ntoskrnlAddr) {
 					function_address = intel_driver::GetKernelModuleExport(intel_driver::ntoskrnlAddr, current_function_data.name);
-					if (!function_address) {
+				}
+				if (!function_address) {
 #if !defined(DISABLE_OUTPUT)
-						std::cout << "[-] Failed to resolve import " << current_function_data.name << " (" << current_import.module_name << ")" << std::endl;
+					std::cout << "[-] Failed to resolve import " << current_function_data.name << " (" << current_import.module_name << ")" << std::endl;
 #endif
-						return false;
-					}
+					return false;
 				}
 			}
 
@@ -91,36 +86,64 @@ bool ResolveImports(portable_executable::vec_imports imports) {
 	return true;
 }
 
-ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool free, bool destroyHeader, AllocationMode mode, bool PassAllocationAddressAsFirstParam, mapCallback callback, NTSTATUS* exitCode) {
-
-	const PIMAGE_NT_HEADERS64 nt_headers = portable_executable::GetNtHeaders(data);
-
-	if (!nt_headers) {
-		kdmLog(L"[-] Invalid format of PE image" << std::endl);
+ULONG64 kdmapper::MapDriver(BYTE* data, size_t data_size, ULONG64 param1, ULONG64 param2, bool free, bool destroyHeader, AllocationMode mode, bool PassAllocationAddressAsFirstParam, mapCallback callback, NTSTATUS* exitCode, kdmapper::map_result* outcome) {
+	if (outcome) *outcome = {};
+	PIMAGE_NT_HEADERS64 nt_headers = nullptr;
+	if (!portable_executable::ValidateFileImage(data, data_size, &nt_headers)) {
+		kdmLog(L"[-] Invalid or truncated PE image" << std::endl);
 		return 0;
 	}
-
-	if (nt_headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-		kdmLog(L"[-] Image is not 64 bit" << std::endl);
+	if (!intel_driver::IsKernelCallTrampolineIntact()) {
+		if (outcome) outcome->trampoline_intact = false;
 		return 0;
 	}
 
 	ULONG32 image_size = nt_headers->OptionalHeader.SizeOfImage;
+	const size_t full_image_size = image_size;
 
 	void* local_image_base = VirtualAlloc(nullptr, image_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	if (!local_image_base)
 		return 0;
 
 	DWORD TotalVirtualHeaderSize = (IMAGE_FIRST_SECTION(nt_headers))->VirtualAddress;
+	memcpy(local_image_base, data, nt_headers->OptionalHeader.SizeOfHeaders);
+	const PIMAGE_SECTION_HEADER current_image_section = IMAGE_FIRST_SECTION(nt_headers);
+	for (auto i = 0; i < nt_headers->FileHeader.NumberOfSections; ++i) {
+		if ((current_image_section[i].Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) > 0 ||
+			!current_image_section[i].SizeOfRawData)
+			continue;
+		auto local_section = reinterpret_cast<void*>(reinterpret_cast<ULONG64>(local_image_base) + current_image_section[i].VirtualAddress);
+		memcpy(local_section, data + current_image_section[i].PointerToRawData, current_image_section[i].SizeOfRawData);
+	}
+	portable_executable::vec_relocs relocations;
+	portable_executable::vec_imports imports;
+	if (!portable_executable::ValidateLoadConfig(local_image_base, full_image_size) ||
+		!portable_executable::GetRelocs(local_image_base, full_image_size, &relocations) ||
+		!portable_executable::GetImports(local_image_base, full_image_size, &imports)) {
+		kdmLog(L"[-] Invalid PE relocation, import, or load configuration data" << std::endl);
+		VirtualFree(local_image_base, 0, MEM_RELEASE);
+		return 0;
+	}
 	image_size = image_size - (destroyHeader ? TotalVirtualHeaderSize : 0);
 
-	ULONG64 kernel_image_base = 0;
+	intel_driver::kernel_allocation_result allocation{};
 	if (mode == AllocationMode::AllocateIndependentPages)
 	{
-		kernel_image_base = intel_driver::MmAllocateIndependentPagesEx(image_size);
+		allocation = intel_driver::MmAllocateIndependentPagesExDetailed(image_size);
 	}
 	else { // AllocatePool by default
-		kernel_image_base = intel_driver::AllocatePool(nt::POOL_TYPE::NonPagedPool, image_size);
+		allocation = intel_driver::AllocatePoolDetailed(nt::POOL_TYPE::NonPagedPool, image_size);
+	}
+	ULONG64 kernel_image_base = allocation.address;
+	if (outcome) {
+		outcome->trampoline_intact = allocation.call.trampoline_intact;
+		outcome->image_retained = allocation.address != 0;
+		outcome->image_base = allocation.address;
+	}
+	if (!allocation.call.trampoline_intact) {
+		kdmLog(L"[-] Kernel call trampoline restoration is unverified after image allocation" << std::endl);
+		VirtualFree(local_image_base, 0, MEM_RELEASE);
+		return 0;
 	}
 
 	if (!kernel_image_base) {
@@ -133,38 +156,34 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	do {
 		kdmLog(L"[+] Image base has been allocated at 0x" << reinterpret_cast<void*>(kernel_image_base) << std::endl);
 
-		// Copy image headers
-
-		memcpy(local_image_base, data, nt_headers->OptionalHeader.SizeOfHeaders);
-
-		// Copy image sections
-
-		const PIMAGE_SECTION_HEADER current_image_section = IMAGE_FIRST_SECTION(nt_headers);
-
-		for (auto i = 0; i < nt_headers->FileHeader.NumberOfSections; ++i) {
-			if ((current_image_section[i].Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) > 0)
-				continue;
-			auto local_section = reinterpret_cast<void*>(reinterpret_cast<ULONG64>(local_image_base) + current_image_section[i].VirtualAddress);
-			memcpy(local_section, reinterpret_cast<void*>(reinterpret_cast<ULONG64>(data) + current_image_section[i].PointerToRawData), current_image_section[i].SizeOfRawData);
-		}
-
 		ULONG64 realBase = kernel_image_base;
 		if (destroyHeader) {
 			kernel_image_base -= TotalVirtualHeaderSize;
 			kdmLog(L"[+] Skipped 0x" << std::hex << TotalVirtualHeaderSize << L" bytes of PE Header" << std::endl);
 		}
+		if (relocations.empty() && kernel_image_base != nt_headers->OptionalHeader.ImageBase) {
+			kdmLog(L"[-] Image has no usable relocations for its allocated base" << std::endl);
+			kernel_image_base = realBase;
+			break;
+		}
 
 		// Resolve relocs and imports
 
-		RelocateImageByDelta(portable_executable::GetRelocs(local_image_base), kernel_image_base - nt_headers->OptionalHeader.ImageBase);
-
-		if (!FixSecurityCookie(local_image_base, kernel_image_base ))
-		{
-			kdmLog(L"[-] Failed to fix cookie" << std::endl);
-			return 0;
+		if (!portable_executable::ApplyRelocations(local_image_base, full_image_size,
+			relocations, kernel_image_base - nt_headers->OptionalHeader.ImageBase)) {
+			kdmLog(L"[-] Failed to apply validated relocations" << std::endl);
+			kernel_image_base = realBase;
+			break;
 		}
 
-		if (!ResolveImports(portable_executable::GetImports(local_image_base))) {
+		if (!FixSecurityCookie(local_image_base, full_image_size, kernel_image_base ))
+		{
+			kdmLog(L"[-] Failed to fix cookie" << std::endl);
+			kernel_image_base = realBase;
+			break;
+		}
+
+		if (!ResolveImports(imports)) {
 			kdmLog(L"[-] Failed to resolve imports" << std::endl);
 			kernel_image_base = realBase;
 			break;
@@ -180,6 +199,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 		if (mode == AllocationMode::AllocateIndependentPages)
 		{
+			bool protection_ok = true;
 			auto ProtectionToString = [](ULONG prot) -> const char* {
 				switch (prot)
 				{
@@ -195,11 +215,14 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 			for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++) {
 				auto sec = &IMAGE_FIRST_SECTION(nt_headers)[i];
+				std::wstring section_name;
+				for (unsigned j = 0; j < sizeof(sec->Name) && sec->Name[j]; ++j)
+					section_name.push_back(static_cast<wchar_t>(sec->Name[j]));
 				uintptr_t secAddr = kernel_image_base + sec->VirtualAddress;
 				uint32_t secSize = sec->Misc.VirtualSize;
 
 				if (secSize <= 0) {
-					kdmLog(L"[*] Skipping empty section: " << (char*)sec->Name << std::endl);
+					kdmLog(L"[*] Skipping empty section: " << section_name << std::endl);
 					continue;
 				}
 
@@ -217,15 +240,21 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 				}
 
 				kdmLog(L"[+] Setting protection for section: "
-					<< (char*)sec->Name
+					<< section_name
 					<< L" Base: 0x" << std::hex << secAddr
 					<< L" Size: 0x" << secSize
 					<< L" Prot: " << ProtectionToString(prot)
 					<< std::dec << std::endl);
 
 				if (!intel_driver::MmSetPageProtection(secAddr, secSize, prot)) {
-					kdmLog(L"[-] Failed to set protection for section: " << (char*)sec->Name << std::endl);
+					kdmLog(L"[-] Failed to set protection for section: " << section_name << std::endl);
+					protection_ok = false;
+					break;
 				}
+			}
+			if (!protection_ok) {
+				kernel_image_base = realBase;
+				break;
 			}
 		}
 
@@ -244,35 +273,54 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		}
 
 		NTSTATUS status = 0;
-		if (!intel_driver::CallKernelFunction(&status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
+		auto const entry_call = intel_driver::CallKernelFunctionDetailed(&status,
+			address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2);
+		if (outcome) {
+			outcome->entry_invoked = entry_call.target_invoked;
+			outcome->trampoline_intact = entry_call.trampoline_intact;
+		}
+		if (entry_call.target_invoked && exitCode) *exitCode = status;
+		if (!entry_call.trampoline_intact) {
+			kdmLog(L"[-] Kernel call trampoline restoration is unverified; retaining mapped image" << std::endl);
+			VirtualFree(local_image_base, 0, MEM_RELEASE);
+			return 0;
+		}
+		if (!entry_call.target_invoked) {
 			kdmLog(L"[-] Failed to call driver entry" << std::endl);
 			kernel_image_base = realBase;
 			break;
 		}
-
-		if (exitCode)
-			*exitCode = status;
 
 		kdmLog(L"[+] DriverEntry returned 0x" << std::hex << status << std::endl);
 
 		// Free memory
 		if (free) {
 			kdmLog(L"[+] Freeing memory" << std::endl);
-			bool free_status = false;
+			intel_driver::kernel_call_result release{};
 
 			if (mode == AllocationMode::AllocateIndependentPages)
 			{
-				free_status = intel_driver::MmFreeIndependentPages(realBase, image_size);
+				release = intel_driver::MmFreeIndependentPagesDetailed(realBase, image_size);
 			}
 			else {
-				free_status = intel_driver::FreePool(realBase);
+				release = intel_driver::FreePoolDetailed(realBase);
+			}
+			bool const free_status = release.target_invoked && release.trampoline_intact;
+			if (outcome) {
+				outcome->trampoline_intact = release.trampoline_intact;
+				outcome->image_retained = !free_status;
+				outcome->image_release_call_completed = free_status;
 			}
 
 			if (free_status) {
-				kdmLog(L"[+] Memory has been released" << std::endl);
+				kdmLog(L"[+] Memory release call completed" << std::endl);
 			}
 			else {
-				kdmLog(L"[-] WARNING: Failed to free memory!" << std::endl);
+				kdmLog(L"[-] WARNING: Memory release was not confirmed!" << std::endl);
+			}
+			if (!free_status) {
+				VirtualFree(local_image_base, 0, MEM_RELEASE);
+				return 0;
 			}
 		}
 
@@ -285,23 +333,38 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 
 	VirtualFree(local_image_base, 0, MEM_RELEASE);
+	if (!intel_driver::IsKernelCallTrampolineIntact()) {
+		kdmLog(L"[-] Kernel call trampoline is unverified; retaining mapped image" << std::endl);
+		if (outcome) {
+			outcome->trampoline_intact = false;
+			outcome->image_retained = true;
+			outcome->image_base = kernel_image_base;
+		}
+		return 0;
+	}
 
 	kdmLog(L"[+] Freeing memory" << std::endl);
-	bool free_status = false;
+	intel_driver::kernel_call_result release{};
 
 	if (mode == AllocationMode::AllocateIndependentPages)
 	{
-		free_status = intel_driver::MmFreeIndependentPages(kernel_image_base, image_size);
+		release = intel_driver::MmFreeIndependentPagesDetailed(kernel_image_base, image_size);
 	}
 	else {
-		free_status = intel_driver::FreePool(kernel_image_base);
+		release = intel_driver::FreePoolDetailed(kernel_image_base);
+	}
+	bool const free_status = release.target_invoked && release.trampoline_intact;
+	if (outcome) {
+		outcome->trampoline_intact = release.trampoline_intact;
+		outcome->image_retained = !free_status;
+		outcome->image_release_call_completed = free_status;
 	}
 
 	if (free_status) {
-		kdmLog(L"[+] Memory has been released" << std::endl);
+		kdmLog(L"[+] Memory release call completed" << std::endl);
 	}
 	else {
-		kdmLog(L"[-] WARNING: Failed to free memory!" << std::endl);
+		kdmLog(L"[-] WARNING: Memory release was not confirmed!" << std::endl);
 	}
 
 	return 0;

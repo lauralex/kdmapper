@@ -12,13 +12,20 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 	const std::wstring nPath = L"\\??\\" + driver_path;
 
 	HKEY dservice;
-	LSTATUS status = RegCreateKeyW(HKEY_LOCAL_MACHINE, servicesPath.c_str(), &dservice); //Returns Ok if already exists
+	DWORD disposition = 0;
+	LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, servicesPath.c_str(), 0,
+		nullptr, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, nullptr, &dservice, &disposition);
 	if (status != ERROR_SUCCESS) {
 		kdmLog("[-] Can't create service key" << std::endl);
 		return STATUS_REGISTRY_IO_FAILED;
 	}
+	if (disposition != REG_CREATED_NEW_KEY) {
+		RegCloseKey(dservice);
+		kdmLog("[-] Refusing to reuse an existing driver service key" << std::endl);
+		return STATUS_ALREADY_REGISTERED;
+	}
 
-	status = RegSetKeyValueW(dservice, NULL, L"ImagePath", REG_EXPAND_SZ, nPath.c_str(), (DWORD)(nPath.size()*sizeof(wchar_t)));
+	status = RegSetKeyValueW(dservice, NULL, L"ImagePath", REG_EXPAND_SZ, nPath.c_str(), (DWORD)((nPath.size() + 1) * sizeof(wchar_t)));
 	if (status != ERROR_SUCCESS) {
 		RegCloseKey(dservice);
 		RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
@@ -63,9 +70,7 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 	kdmLog("[+] NtLoadDriver Status 0x" << std::hex << ntStatus << std::endl);
 
 	if (ntStatus == STATUS_IMAGE_CERT_REVOKED) {
-		kdmLog("[-] Your vulnerable driver list is enabled and have blocked the driver loading, you must disable vulnerable driver list to use kdmapper with intel driver" << std::endl);
-		kdmLog("[-] Registry path to disable vulnerable driver list: HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config" << std::endl);
-		kdmLog("[-] Set 'VulnerableDriverBlocklistEnable' as dword to 0" << std::endl);
+		kdmLog("[-] Windows code integrity rejected the helper driver on this configuration" << std::endl);
 	}
 	else if (ntStatus == STATUS_ACCESS_DENIED || ntStatus == STATUS_INSUFFICIENT_RESOURCES) {
 		kdmLog("[-] Access Denied or Insufficient Resources (0x" << std::hex << ntStatus << "), Probably some anticheat or antivirus running blocking the load of vulnerable driver" << std::endl);
@@ -82,9 +87,10 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 	return ntStatus;
 }
 
-NTSTATUS service::StopAndRemove(const std::wstring& serviceName) {
-	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-	if (ntdll == NULL)
+NTSTATUS service::StopAndRemove(const std::wstring& serviceName,
+	bool driver_already_unloaded, bool* driver_unloaded) {
+	if (driver_unloaded) *driver_unloaded = driver_already_unloaded;
+	if (!driver_already_unloaded && GetModuleHandleA("ntdll.dll") == NULL)
 		return STATUS_UNSUCCESSFUL;
 
 	std::wstring wdriver_reg_path = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" + serviceName;
@@ -96,23 +102,25 @@ NTSTATUS service::StopAndRemove(const std::wstring& serviceName) {
 	LSTATUS status = RegOpenKeyW(HKEY_LOCAL_MACHINE, servicesPath.c_str(), &driver_service);
 	if (status != ERROR_SUCCESS) {
 		if (status == ERROR_FILE_NOT_FOUND) {
-			return STATUS_SUCCESS; //already removed
+			return driver_already_unloaded ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 		}
 		return STATUS_REGISTRY_IO_FAILED;
 	}
 	RegCloseKey(driver_service);
 
-	NTSTATUS st = nt::NtUnloadDriver(&serviceStr);
-	kdmLog("[+] NtUnloadDriver Status 0x" << std::hex << st << std::endl);
-	if (st != ERROR_SUCCESS) {
-		kdmLog("[-] Driver Unload Failed!!" << std::endl);
-		status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
-		return st; //lets consider unload fail as error because can cause problems with anti cheats later
+	if (!driver_already_unloaded) {
+		NTSTATUS const st = nt::NtUnloadDriver(&serviceStr);
+		kdmLog("[+] NtUnloadDriver Status 0x" << std::hex << st << std::endl);
+		if (!NT_SUCCESS(st)) {
+			kdmLog("[-] Driver Unload Failed!!" << std::endl);
+			return st; // Keep the service key so this helper can be retried.
+		}
+		if (driver_unloaded) *driver_unloaded = true;
 	}
 
 	status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
 	if (status != ERROR_SUCCESS) {
 		return STATUS_REGISTRY_IO_FAILED;
 	}
-	return st;
+	return STATUS_SUCCESS;
 }
