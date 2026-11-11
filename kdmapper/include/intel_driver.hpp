@@ -21,12 +21,21 @@ namespace intel_driver
 	extern HANDLE hDevice;
 	extern ULONG64 ntoskrnlAddr;
 
+	bool ClearPiDDBCacheTable();
+	bool ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait);
+	bool ExReleaseResourceLite(PVOID Resource);
+	BOOLEAN RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer);
+	PVOID RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PVOID Buffer);
+	nt::PiDDBCacheEntry* LookupEntry(nt::PRTL_AVL_TABLE PiDDBCacheTable, ULONG timestamp, const wchar_t * name);
 	PVOID ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG OffsetOffset, _In_ ULONG InstructionSize);
 	NTSTATUS AcquireDebugPrivilege();
 
 	uintptr_t FindPatternAtKernel(uintptr_t dwAddress, uintptr_t dwLen, BYTE* bMask, const char* szMask);
 	uintptr_t FindSectionAtKernel(const char* sectionName, uintptr_t modulePtr, PULONG size);
 	uintptr_t FindPatternInSectionAtKernel(const char* sectionName, uintptr_t modulePtr, BYTE* bMask, const char* szMask);
+
+	bool ClearKernelHashBucketList();
+	bool ClearWdFilterDriverList();
 
 	bool IsRunning();
 	// Called after the helper and ntoskrnl are available. The callback return
@@ -99,6 +108,7 @@ namespace intel_driver
 	bool FreePool(uint64_t address);
 	kernel_call_result FreePoolDetailed(uint64_t address);
 	uint64_t GetKernelModuleExport(uint64_t kernel_module_base, const std::string& function_name);
+	bool ClearMmUnloadedDrivers();
 	std::wstring GetDriverNameW();
 	std::wstring GetDriverPath();
 	std::mutex& KernelCallMutex();

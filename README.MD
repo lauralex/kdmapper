@@ -32,7 +32,10 @@ Signature lookup is version-dependent and is not proof of symbol identity.
 	
 	Works with /GS- compiled drivers
 	Hooks NtAddAtom which exists everywhere and is rarely called
-	Leaves Windows driver-load records intact; helper load and unload do not depend on private cache or list cleanup
+	Clears MmUnloadedDrivers
+	Clears PiDDBCacheTable
+	Clears g_KernelHashBucketList
+	Clears Wdfilter RuntimeDriverList RuntimeDriverCount and RuntimeDriverArry
 	Uses NtLoadDriver and NtUnloadDriver for helper lifecycle
 	Prevent load if \Device\Nal exists (Prevents BSOD)
 	Header section skipped while copying driver to kernel
