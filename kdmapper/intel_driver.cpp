@@ -167,18 +167,8 @@ bool intel_driver::ConfigureIndependentPageRvas(independent_page_rvas rvas) {
 }
 
 bool intel_driver::RestoreKernelCallTrampoline(uint64_t address, const uint8_t* original, uint32_t size) {
-	if (!address || !original || !size) return false;
-	if (size > 32) return false;
-	uint8_t observed[32]{};
-	auto restored = [&]() {
-		return ReadMemory(address, observed, size) && std::memcmp(observed, original, size) == 0;
-	};
-	if (restored()) return true;
-	for (unsigned attempt = 0; attempt < 2; ++attempt) {
-		(void)WriteToReadOnlyMemory(address, const_cast<uint8_t*>(original), size);
-		if (restored()) return true;
-	}
-	return false;
+	return detail::RestoreKernelCallTrampolineWith(address, original, size,
+		ReadMemory, WriteToReadOnlyMemory);
 }
 
 std::wstring intel_driver::GetDriverNameW() {

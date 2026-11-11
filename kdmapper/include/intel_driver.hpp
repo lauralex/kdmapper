@@ -105,6 +105,23 @@ namespace intel_driver
 	bool IsKernelCallTrampolineIntact();
 	void MarkKernelCallTrampolineUnverified();
 	bool RestoreKernelCallTrampoline(uint64_t address, const uint8_t* original, uint32_t size);
+	namespace detail {
+		template<typename Read, typename Write>
+		bool RestoreKernelCallTrampolineWith(uint64_t address, const uint8_t* original,
+			uint32_t size, Read read, Write write) {
+			if (!address || !original || !size || size > 32) return false;
+			uint8_t observed[32]{};
+			auto restored = [&]() {
+				return read(address, observed, size) && std::memcmp(observed, original, size) == 0;
+			};
+			if (restored()) return true;
+			for (unsigned attempt = 0; attempt < 2; ++attempt) {
+				(void)write(address, const_cast<uint8_t*>(original), size);
+				if (restored()) return true;
+			}
+			return false;
+		}
+	}
 
 	template<typename T, typename ...A>
 	kernel_call_result CallKernelFunctionDetailed(T* out_result, uint64_t kernel_function_address, const A ...arguments) {
@@ -145,7 +162,6 @@ namespace intel_driver
 		}
 
 		uint8_t kernel_injected_jmp[] = { 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xe0 };
-		uint8_t original_kernel_function[sizeof(kernel_injected_jmp)];
 		std::memcpy(&kernel_injected_jmp[2], &kernel_function_address, sizeof(kernel_function_address));
 
 		static uint64_t kernel_NtAddAtom = 0;
@@ -155,35 +171,74 @@ namespace intel_driver
 			kdmLog(L"[-] Failed to get export ntoskrnl.NtAddAtom" << std::endl);
 			return outcome;
 		}
-		// The physical-write helper translates only the first page.
-		if ((kernel_NtAddAtom & 0xfff) > 0x1000 - sizeof(kernel_injected_jmp))
+		constexpr uint8_t endbr64[] = { 0xf3, 0x0f, 0x1e, 0xfa };
+		if (kernel_NtAddAtom > (std::numeric_limits<uint64_t>::max)() - (sizeof(endbr64) - 1))
 			return outcome;
-
-		if (!ReadMemory(kernel_NtAddAtom, &original_kernel_function, sizeof(kernel_injected_jmp)))
+		uint8_t original_prefix[sizeof(endbr64)]{};
+		if (!ReadMemory(kernel_NtAddAtom, original_prefix, sizeof(original_prefix)))
 			return outcome;
+		auto const has_landing_pad = std::memcmp(original_prefix, endbr64, sizeof(endbr64)) == 0;
+		uint32_t const patch_offset = has_landing_pad ? static_cast<uint32_t>(sizeof(endbr64)) : 0;
+		if (kernel_NtAddAtom > (std::numeric_limits<uint64_t>::max)() - patch_offset)
+			return outcome;
+		auto const patch_address = kernel_NtAddAtom + patch_offset;
+		// The physical-write helper translates only the first page. Preserve an
+		// existing IBT landing pad and apply this gate to the actual suffix write.
+		if ((patch_address & 0xfff) > 0x1000 - sizeof(kernel_injected_jmp))
+			return outcome;
+		uint32_t const original_size = patch_offset + static_cast<uint32_t>(sizeof(kernel_injected_jmp));
+		uint8_t original_kernel_function[sizeof(endbr64) + sizeof(kernel_injected_jmp)]{};
 
-		if (original_kernel_function[0] == kernel_injected_jmp[0] &&
-			original_kernel_function[1] == kernel_injected_jmp[1] &&
-			original_kernel_function[sizeof(kernel_injected_jmp) - 2] == kernel_injected_jmp[sizeof(kernel_injected_jmp) - 2] &&
-			original_kernel_function[sizeof(kernel_injected_jmp) - 1] == kernel_injected_jmp[sizeof(kernel_injected_jmp) - 1]) {
+		if (!ReadMemory(kernel_NtAddAtom, original_kernel_function, original_size))
+			return outcome;
+		if (std::memcmp(original_kernel_function, original_prefix, sizeof(original_prefix)) != 0) {
+			MarkKernelCallTrampolineUnverified();
+			outcome.trampoline_intact = false;
+			return outcome;
+		}
+
+		if (original_kernel_function[patch_offset] == kernel_injected_jmp[0] &&
+			original_kernel_function[patch_offset + 1] == kernel_injected_jmp[1] &&
+			original_kernel_function[original_size - 2] == kernel_injected_jmp[sizeof(kernel_injected_jmp) - 2] &&
+			original_kernel_function[original_size - 1] == kernel_injected_jmp[sizeof(kernel_injected_jmp) - 1]) {
 			kdmLog(L"[-] FAILED!: The code was already hooked!! another instance of kdmapper running?!" << std::endl);
 			MarkKernelCallTrampolineUnverified();
 			outcome.trampoline_intact = false;
 			return outcome;
 		}
 
-		// Overwrite the pointer with kernel_function_address
-		if (!WriteToReadOnlyMemory(kernel_NtAddAtom, &kernel_injected_jmp, sizeof(kernel_injected_jmp))) {
-			if (!RestoreKernelCallTrampoline(kernel_NtAddAtom, original_kernel_function, sizeof(original_kernel_function))) {
+		bool landing_pad_changed = false;
+		auto restore_trampoline = [&]() {
+			// Never write the preserved prefix, even during recovery. A suffix
+			// restoration alone cannot establish that the complete entry is intact.
+			auto const suffix_restored = RestoreKernelCallTrampoline(
+				patch_address, original_kernel_function + patch_offset, sizeof(kernel_injected_jmp));
+			uint8_t restored_bytes[sizeof(original_kernel_function)]{};
+			auto const read_back = ReadMemory(kernel_NtAddAtom, restored_bytes, original_size);
+			if (read_back && has_landing_pad &&
+				std::memcmp(restored_bytes, original_prefix, sizeof(original_prefix)) != 0)
+				landing_pad_changed = true;
+			return suffix_restored && read_back && !landing_pad_changed &&
+				std::memcmp(restored_bytes, original_kernel_function, original_size) == 0;
+		};
+
+		if (!WriteToReadOnlyMemory(patch_address, &kernel_injected_jmp, sizeof(kernel_injected_jmp))) {
+			if (!restore_trampoline()) {
 				MarkKernelCallTrampolineUnverified();
 				outcome.trampoline_intact = false;
 			}
 			return outcome;
 		}
-		uint8_t patched_bytes[sizeof(kernel_injected_jmp)]{};
-		if (!ReadMemory(kernel_NtAddAtom, patched_bytes, sizeof(patched_bytes)) ||
-			std::memcmp(patched_bytes, kernel_injected_jmp, sizeof(patched_bytes)) != 0) {
-			if (!RestoreKernelCallTrampoline(kernel_NtAddAtom, original_kernel_function, sizeof(original_kernel_function))) {
+		uint8_t expected_bytes[sizeof(original_kernel_function)]{};
+		std::memcpy(expected_bytes, original_kernel_function, original_size);
+		std::memcpy(expected_bytes + patch_offset, kernel_injected_jmp, sizeof(kernel_injected_jmp));
+		uint8_t patched_bytes[sizeof(original_kernel_function)]{};
+		auto const read_back = ReadMemory(kernel_NtAddAtom, patched_bytes, original_size);
+		if (read_back && has_landing_pad &&
+			std::memcmp(patched_bytes, original_prefix, sizeof(original_prefix)) != 0)
+			landing_pad_changed = true;
+		if (!read_back || std::memcmp(patched_bytes, expected_bytes, original_size) != 0) {
+			if (!restore_trampoline()) {
 				MarkKernelCallTrampolineUnverified();
 				outcome.trampoline_intact = false;
 			}
@@ -207,8 +262,7 @@ namespace intel_driver
 
 		// A reported write success is insufficient: read back the exact original
 		// bytes before any caller may use another kernel-call trampoline.
-		outcome.trampoline_restored = RestoreKernelCallTrampoline(
-			kernel_NtAddAtom, original_kernel_function, sizeof(original_kernel_function));
+		outcome.trampoline_restored = restore_trampoline();
 		if (!outcome.trampoline_restored) {
 			MarkKernelCallTrampolineUnverified();
 			outcome.trampoline_intact = false;
